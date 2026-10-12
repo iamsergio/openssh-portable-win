@@ -8,7 +8,8 @@
 # Usage: scripts/deploy.sh [--no-build] [--debug] [--arch x64|arm64] [--prefix <windows dir>]
 #
 # Build prerequisites: Visual Studio 2022 (not 2026) with the "Desktop development
-# with C++" workload and the vcpkg component (LibreSSL comes from vcpkg).
+# with C++" workload and the Spectre-mitigated libs. LibreSSL & co. come from
+# a vcpkg clone next to this repo (or $VCPKG_ROOT), cloned on first run.
 
 set -euo pipefail
 
@@ -23,7 +24,7 @@ while [ $# -gt 0 ]; do
         --debug) config=Debug ;;
         --arch) arch="$2"; shift ;;
         --prefix) prefix="$2"; shift ;;
-        -h|--help) sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
     shift
@@ -50,21 +51,58 @@ net session >/dev/null 2>&1 || die "must run elevated (Run as administrator)"
 [ -z "${SSH_CONNECTION:-}" ] || die "running over ssh; sshd will be stopped, use the console or RDP"
 
 if [ "$build" = 1 ]; then
+    # Same layout as upstream's .github/tools/Install-VcpkgDependencies.ps1:
+    # a vcpkg clone next to the repo, or $VCPKG_ROOT
+    vcpkg_root="$(dirname "$repo")/vcpkg"
+    [ -n "${VCPKG_ROOT:-}" ] && vcpkg_root="$(cygpath -u "$VCPKG_ROOT")"
+    if [ ! -d "$vcpkg_root" ]; then
+        step "Cloning vcpkg into $vcpkg_root"
+        git clone https://github.com/microsoft/vcpkg.git "$vcpkg_root"
+    fi
+
+    step "Installing dependencies with vcpkg"
     # The build helper only recognizes VS 2017-2022 and the projects pin the
-    # v143 toolset, so VS 2026 alone won't do; VS 2022 can sit next to it
-    run_ps "$arch" <<'PS'
-$arch = $args[0]
+    # v143 toolset, so VS 2026 alone won't do; VS 2022 can sit next to it.
+    # Install-VcpkgDependencies.ps1 itself isn't used: it doesn't parse under
+    # Windows PowerShell 5.1 (UTF-8 without BOM) and doesn't set an exit code.
+    run_ps "$repo_win" "$arch" "$(cygpath -w "$vcpkg_root")" <<'PS'
+$repo, $arch, $vcpkgRoot = $args
 $vc = @{ x64 = 'x86.x64'; x86 = 'x86.x64'; arm64 = 'ARM64'; arm = 'ARM' }[$arch]
 $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-$vs = if (Test-Path $vswhere) {
-    & $vswhere -products * -version '[17.0,18.0)' -property installationPath `
-        -requires "Microsoft.VisualStudio.Component.VC.Tools.$vc" Microsoft.VisualStudio.Component.Vcpkg
+$vs = $null
+if (Test-Path $vswhere) {
+    $vs = & $vswhere -products * -version '[17.0,18.0)' -property installationPath -requires `
+        "Microsoft.VisualStudio.Component.VC.Tools.$vc" "Microsoft.VisualStudio.Component.VC.Runtimes.$vc.Spectre" |
+        Select-Object -First 1
 }
 if (-not $vs) {
-    Write-Host "Visual Studio 2022 with C++ tools and vcpkg not found (VS 2026 is not supported by the build). Install the Build Tools with:"
-    Write-Host "  winget install Microsoft.VisualStudio.2022.BuildTools --override `"--wait --passive --add Microsoft.VisualStudio.Workload.VCTools --add Microsoft.VisualStudio.Component.Vcpkg --includeRecommended`""
+    Write-Host "Visual Studio 2022 with C++ tools and Spectre-mitigated libs not found (VS 2026 is not supported by the build). Install the Build Tools with:"
+    Write-Host "  winget install Microsoft.VisualStudio.2022.BuildTools --override `"--wait --passive --add Microsoft.VisualStudio.Workload.VCTools --add Microsoft.VisualStudio.Component.VC.Runtimes.$vc.Spectre --includeRecommended`""
+    Write-Host "or add those components to an existing VS 2022 with the Visual Studio Installer."
     exit 1
 }
+# Otherwise vcpkg compiles the ports with the newest VS, i.e. 2026
+$env:VCPKG_VISUAL_STUDIO_PATH = $vs
+
+$vcpkg = Join-Path $vcpkgRoot 'vcpkg.exe'
+if (-not (Test-Path $vcpkg)) {
+    & (Join-Path $vcpkgRoot 'bootstrap-vcpkg.bat') -disableMetrics
+    if ($LASTEXITCODE -ne 0) { throw "bootstrap-vcpkg.bat failed" }
+}
+
+# The projects read vcpkg_installed\<triplet>\<triplet>\, the layout MSBuild's
+# vcpkg integration produces, hence the explicit install root
+$triplet = "$arch-custom"
+Push-Location "$repo\contrib\win32\openssh"
+try {
+    & $vcpkg install --triplet $triplet --x-install-root="vcpkg_installed\$triplet" `
+        --overlay-triplets=vcpkg_triplets --overlay-ports=vcpkg_overlay_ports
+    if ($LASTEXITCODE -ne 0) { throw "vcpkg install failed" }
+    if (-not (Test-Path "vcpkg_installed\$triplet\$triplet\include\openssl\opensslv.h")) {
+        throw "vcpkg install finished but LibreSSL headers are not in vcpkg_installed\$triplet\$triplet\include"
+    }
+}
+finally { Pop-Location }
 PS
 
     step "Building $config/$arch"
