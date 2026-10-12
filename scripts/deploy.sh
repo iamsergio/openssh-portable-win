@@ -4,8 +4,9 @@
 #
 # Run from an elevated msys/Git bash, on the Windows console or RDP,
 # not over ssh: the running sshd gets stopped and its binaries replaced.
+# --build-only skips the install and is fine over ssh.
 #
-# Usage: scripts/deploy.sh [--no-build] [--debug] [--arch x64|arm64] [--prefix <windows dir>]
+# Usage: scripts/deploy.sh [--no-build|--build-only] [--debug] [--arch x64|arm64] [--prefix <windows dir>]
 #
 # Build prerequisites: Visual Studio 2022 (not 2026) with the "Desktop development
 # with C++" workload and the Spectre-mitigated libs. LibreSSL & co. come from
@@ -14,6 +15,7 @@
 set -euo pipefail
 
 build=1
+install=1
 config=Release
 arch=x64
 prefix='C:\Program Files\OpenSSH'
@@ -21,10 +23,11 @@ prefix='C:\Program Files\OpenSSH'
 while [ $# -gt 0 ]; do
     case "$1" in
         --no-build) build=0 ;;
+        --build-only) install=0 ;;
         --debug) config=Debug ;;
         --arch) arch="$2"; shift ;;
         --prefix) prefix="$2"; shift ;;
-        -h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
     shift
@@ -47,8 +50,11 @@ run_ps() {
 }
 
 command -v cygpath >/dev/null || die "run this from msys/Git bash on Windows"
+[ "$build" = 1 ] || [ "$install" = 1 ] || die "--no-build and --build-only together do nothing"
 net session >/dev/null 2>&1 || die "must run elevated (Run as administrator)"
-[ -z "${SSH_CONNECTION:-}" ] || die "running over ssh; sshd will be stopped, use the console or RDP"
+if [ "$install" = 1 ] && [ -n "${SSH_CONNECTION:-}" ]; then
+    die "running over ssh; sshd will be stopped, use the console or RDP (or --build-only)"
+fi
 
 if [ "$build" = 1 ]; then
     # Same layout as upstream's .github/tools/Install-VcpkgDependencies.ps1:
@@ -123,6 +129,12 @@ try { Start-OpenSSHBuild -NativeHostArch $arch -Configuration $config -Verbose }
 finally { Pop-Location }
 PS
     if [ "$targets_clean" = 1 ]; then git -C "$repo" checkout -q -- "$targets"; fi
+fi
+
+if [ "$install" = 0 ]; then
+    echo
+    echo "Built. Install from an elevated console with: scripts/deploy.sh --no-build"
+    exit 0
 fi
 
 step "Removing existing OpenSSH"
