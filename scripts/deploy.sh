@@ -110,8 +110,13 @@ PS
     targets=contrib/win32/openssh/paths.targets
     targets_clean=0
     git -C "$repo" diff --quiet -- "$targets" && targets_clean=1
-    run_ps "$repo_win" "$config" "$arch" <<'PS'
-$repo, $config, $arch = $args
+    run_ps "$repo_win" "$config" "$arch" "$(cygpath -w "$vcpkg_root")" <<'PS'
+$repo, $config, $arch, $vcpkgRoot = $args
+# Some projects (openbsd_compat, win32iocompat, ssh-shellhost) only get the
+# vcpkg include dir through vcpkg's MSBuild integration. Upstream CI enables
+# it globally with `vcpkg integrate install`; this enables it for this build only.
+$env:ForceImportBeforeCppTargets = "$vcpkgRoot\scripts\buildsystems\msbuild\vcpkg.targets"
+if (-not (Test-Path $env:ForceImportBeforeCppTargets)) { throw "$env:ForceImportBeforeCppTargets not found" }
 Import-Module "$repo\contrib\win32\openssh\OpenSSHBuildHelper.psm1" -Force
 Push-Location $repo
 try { Start-OpenSSHBuild -NativeHostArch $arch -Configuration $config -Verbose }
